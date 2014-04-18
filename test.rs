@@ -1,4 +1,4 @@
-use std::rc::Rc;
+// use std::rc::Rc;
 
 /* The branches in this function exhibit Rust's optional implicit return
    values, which can be utilized where a more "functional" style is preferred.
@@ -21,11 +21,11 @@ fn iterative_factorial(n: int) -> int {
     return result; // An explicit return, in contrast to the prior function.
 }
  
-struct Blub {
-    a : int,
-    b : int,
-    other : Rc<RefCell<Blub>>
-}
+// struct Blub {
+//     a : int,
+//     b : int,
+//     // other : Rc<RefCell<Blub>>
+// }
  /*
 impl Drop for Blub {
     fn drop(&mut self) {
@@ -37,14 +37,14 @@ impl Drop for Blub {
  */
  
 fn main() {
-    let x : Rc<Blub>;
-    
-    let a = RefCell::new
-    let b = Blub {a:1, b:2, other : Rc::new(RefCell<Blub>::new()) };;//= Rc::new(Blub{ a : 1, b : 2, other : x});
-    let c = Blub {a:2, b:3, other : Rc::new(Some(b)) };
-    b.other = Rc::new(Some(c));
-   
-   //b.other = Rc::new(Blub{ a : 1, b : 2, other : x});
     println!("Recursive result: {:i}", recursive_factorial(10));
     println!("Iterative result: {:i}", iterative_factorial(10));
+
+    let s : (~str) = ~"blub";
+    let sr : (&str) = s; // this works -> ok to borrow from owned box
+
+    let st = (~"blub", 1i );
+    let (st_r, i) : (&str, int) = st; // compiler error: mismatched types: expected `(&str,int)` but found `(~str,int)` (str storage differs: expected `&` but found `~`)
+
+    println!( "{} {} {} {}", s, sr, st_r, i);
 }
