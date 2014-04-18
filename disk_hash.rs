@@ -2,6 +2,7 @@
 use std::io::BufferedReader;
 use std::io::File;
 use std::path::Path;
+use std::libc;
 
 fn hash( s : &str ) -> u64 {
   let mut hash : u64 = 5381;
@@ -131,6 +132,84 @@ impl HashBuilder {
   }
 }
 
+
+// struct DiskHash {
+
+// }
+
+// struct FileDescriptor(libc::c_int);
+
+// impl Drop for FileDescriptor {
+//     fn finalize(&self) { unsafe { libc::close(**self); } }
+// }
+
+// unsafe fn open(filename : &str) -> FileDescriptor {
+//     let fd = libc::open(filename.as_ptr(), libc::O_RDONLY as libc::c_int, 0);
+    
+//     if fd < 0 {
+//         fail!(format!("failure in open({}): {}", filename, std::os::last_os_error()));
+//     }
+//     return FileDescriptor(fd);
+// }
+
+// fn print_chain( map : &std::os::MemoryMap, offs : u64 ) {
+//   let mut next_offs = 0;
+//   let mut name : (~str);
+//   unsafe {
+//     std::slice::raw::buf_as_slice(map.data.offset(offs as int) as *u64, 1, |sl| {
+//       next_offs = sl[0];
+//     });
+//     name = std::str::raw::from_c_str( map.data.offset((offs + 8) as int) as *std::libc::c_char );
+
+
+//   }
+//   print!( " -> {} ", name );
+//   if next_offs != 0 {
+//     print_chain( map, next_offs);
+//   } else {
+//     println!("");
+//   }
+
+// }
+
+fn test_mmap() {
+  let filename = "hash.bin";
+  let path = Path::new(filename);
+  let size = path.stat().unwrap().size;
+
+  let fd = unsafe {libc::open(filename.as_ptr() as *i8, libc::O_RDONLY as libc::c_int, 0)};
+
+  let map = std::os::MemoryMap::new(size as uint, [std::os::MapReadable, std::os::MapFd(fd)]).unwrap();
+
+  let table_size = 8 * 1024;
+
+  unsafe {
+    std::slice::raw::buf_as_slice(map.data as *u64, table_size, |buckets| {
+      for i in range(0, table_size) {
+        if buckets[i] != 0 {
+
+          let mut offs = buckets[i];
+
+          print!( "{}", offs );
+
+          while offs != 0 {
+            let mut name : (~str);
+            name = std::str::raw::from_c_str( map.data.offset((offs + 8) as int) as *std::libc::c_char );
+
+            // is there a better way to load a single u64 from a raw pointer? I guess this will crash on cpus with strict alignment requirements?
+            std::slice::raw::buf_as_slice(map.data.offset(offs as int) as *u64, 1, |sl| {
+              offs = sl[0];
+            });
+            print!( " -> {} ", name );
+          }
+          println!("");
+        }
+      }
+    });
+  }
+}
+
+
 fn main() {
   let path = Path::new("files.txt");
   let mut file = BufferedReader::new(File::open(&path));
@@ -146,4 +225,5 @@ fn main() {
   }
   builder.write("hash.bin");
   
+  test_mmap();
 }
