@@ -22,17 +22,17 @@ fn align( v : u64 ) -> u64 {
     v + (a - (v % a)) % a
 }
 
-struct NameOffsetPair {
-  name : ~str,
-  offset : u64
-}
+// struct NameOffsetPair {
+//   name : ~str,
+//   offset : u64
+// }
 
 struct HashBuilder {
   table_size : u64,
   next_pointers : ~[u64],	
   chain_links : ~[(u64,u64)],
-  file_dest : ~[NameOffsetPair],
-  //file_dest : ~[(~str,u64)],
+  //file_dest : ~[NameOffsetPair],
+  file_dest : ~[(~str,u64)],
   append_pos : u64
 }
 
@@ -47,9 +47,10 @@ impl HashBuilder {
 
     // copy the files to the output file
     for p in self.file_dest.iter() {
-
-      let name : (&str) = p.name;
-      let offset = p.offset; 
+      let (ref name, offset) = *p;
+      let name = name.as_slice();
+    //  let name : (&str) = p.name;
+    //  let offset = p.offset; 
       // print!( "write: {}\n", name );
 
       file.seek(offset as i64, std::io::SeekSet).unwrap();
@@ -105,8 +106,8 @@ impl HashBuilder {
     let mut file_pos = self.append_pos + 8;
     
     // store filename/offset pair for writing later
-    //self.file_dest.push( (filename.into_owned(), file_pos ));
-    self.file_dest.push( NameOffsetPair{ name : filename.into_owned(), offset : file_pos });
+    self.file_dest.push( (filename.into_owned(), file_pos ));
+    // self.file_dest.push( NameOffsetPair{ name : filename.into_owned(), offset : file_pos });
 
     // calculate total space occupied by file / metadata and update append_pos
     file_pos += filename.len() as u64 + 1 + 8;
@@ -172,50 +173,137 @@ impl HashBuilder {
 
 // }
 
-fn test_mmap() {
-  let filename = "hash.bin";
-  let path = Path::new(filename);
-  let size = path.stat().unwrap().size;
+struct DiskHash {
+  fd : libc::c_int,
+  map : std::os::MemoryMap,
+  size : uint,
+  table_size : u64
+}
 
-  let fd = unsafe {libc::open(filename.as_ptr() as *i8, libc::O_RDONLY as libc::c_int, 0)};
+impl DiskHash {
+  fn new( path : &std::path::Path ) -> DiskHash {
+    // let filename = path.filename_str().unwrap();
+    // let filename = filename.as_slice();
+    let filename = "hash.bin";
+    // println!("{}", filename == "hash.bin");
 
-  let map = std::os::MemoryMap::new(size as uint, [std::os::MapReadable, std::os::MapFd(fd)]).unwrap();
+    let size = path.stat().unwrap().size;
+    let fd = unsafe {libc::open(filename.as_ptr() as *i8, libc::O_RDONLY as libc::c_int, 0)};
+    let map = std::os::MemoryMap::new(size as uint, [std::os::MapReadable, std::os::MapFd(fd)]).unwrap();
 
-  let table_size = 8 * 1024;
+    let mut dh = DiskHash{ fd : fd, map : map, size : size as uint, table_size : 0 };
 
-  unsafe {
-    std::slice::raw::buf_as_slice(map.data as *u64, table_size, |buckets| {
-      for i in range(0, table_size) {
-        if buckets[i] != 0 {
+    let ts_offs = size - 8;
+    let table_size = dh.unpack_u64(ts_offs);
 
-          let mut offs = buckets[i];
+    println!("table size: {} {}", ts_offs, table_size);
+    dh.table_size = table_size;
+    dh
+  }
 
-          print!( "{}", offs );
+  fn lookup( &self, name : &str ) -> (u64,u64) {
+    let hash = hash(name);
+    let bucket = hash % self.table_size;
 
-          while offs != 0 {
-            let mut name : (~str);
-            name = std::str::raw::from_c_str( map.data.offset((offs + 8) as int) as *std::libc::c_char );
+    let mut offs = self.unpack_u64(bucket * 8);
+    while offs != 0 {
+      let cur_name = unsafe{std::str::raw::from_c_str( self.map.data.offset((offs + 8) as int) as *std::libc::c_char )};
+      if name == cur_name {
+        offs += 8 + 1 + cur_name.len() as u64;
+        let len = self.unpack_u64(offs);
+        // println!("len: {}", 8 + 1 + cur_name.len() as u64);
 
-            // is there a better way to load a single u64 from a raw pointer? I guess this will crash on cpus with strict alignment requirements?
-            std::slice::raw::buf_as_slice(map.data.offset(offs as int) as *u64, 1, |sl| {
-              offs = sl[0];
-            });
-            print!( " -> {} ", name );
-          }
-          println!("");
-        }
+        offs = align( offs + 8 );
+        return (offs,len);
       }
+      offs = self.unpack_u64(offs);
+    }
+
+    return (0,0);
+  }
+
+  fn unpack_u64( &self, offset : u64 ) -> u64 {
+    let mut v : u64 = 0;
+    let v_ptr = &mut v as *mut u64;
+    
+
+    unsafe {
+      std::ptr::copy_nonoverlapping_memory( v_ptr, self.map.data.offset(offset as int) as *u64, 1);
+      // println!("unpack: {} {} {}", offset, self.map.data.offset(offset as int) as *u64, v );
+
+    }
+    
+    v
+  }
+
+  pub unsafe fn as_slice( &self, name : &str, f: |v: &[u8], len: uint| ) {
+    let (offs,len) = self.lookup(name);
+    // println!("len: {}", len);
+    std::slice::raw::buf_as_slice(self.map.data.offset(offs as int) as *u8, len as uint, |x|{
+      f(x,len as uint);
     });
   }
+// pub unsafe fn buf_as_slice<T,U>(p: *T, len: uint, f: |v: &[T]| -> U)
+//                                -> U {
+//         f(transmute(Slice {
+//             data: p,
+//             len: len
+//         }))
+//     }
+
+
 }
+
+// fn test_mmap() {
+//   let filename = "hash.bin";
+//   let path = Path::new(filename);
+//   let size = path.stat().unwrap().size;
+
+//   let fd = unsafe {libc::open(filename.as_ptr() as *i8, libc::O_RDONLY as libc::c_int, 0)};
+
+//   let map = std::os::MemoryMap::new(size as uint, [std::os::MapReadable, std::os::MapFd(fd)]).unwrap();
+
+//   let table_size = 8 * 1024;
+
+//   unsafe {
+//     std::slice::raw::buf_as_slice(map.data as *u64, table_size, |buckets| {
+//         // for i in range(0, table_size) {
+//         //   if buckets[i] != 0 {
+//       for offs in buckets.iter() {
+//         let mut offs = *offs;
+
+//         if offs != 0 {
+//           // let mut offs = buckets[i];
+
+//           print!( "{}", offs );
+
+//           while offs != 0 {
+//             let mut name : (~str);
+//             name = std::str::raw::from_c_str( map.data.offset((offs + 8) as int) as *std::libc::c_char );
+
+//             let offs_old = offs;
+//             let offs_ptr = &mut offs as *mut u64;
+//             std::ptr::copy_nonoverlapping_memory( offs_ptr, map.data.offset(offs_old as int) as *u64, 1);
+           
+//            // print!("offs: {}", offs);
+
+//             print!( " -> {} ", name );
+//           }
+//           println!("");
+//         }
+//       }
+//     });
+//   }
+// }
 
 
 fn main() {
-  let path = Path::new("files.txt");
-  let mut file = BufferedReader::new(File::open(&path));
 
   let table_size = 8 * 1024;
   let mut builder = HashBuilder::new(table_size);
+
+  let path = Path::new("files.txt");
+  let mut file = BufferedReader::new(File::open(&path));
 
   for line in file.lines() {
     let line = line.unwrap();
@@ -225,5 +313,28 @@ fn main() {
   }
   builder.write("hash.bin");
   
-  test_mmap();
+  // test_mmap();
+  let dh_path = Path::new("hash.bin");
+  let dh = DiskHash::new(&dh_path);
+  let mut file = BufferedReader::new(File::open(&path));
+
+  for line in file.lines() {
+    let line = line.unwrap();
+    let line = line.trim_right();
+    // let offs = dh.lookup(line);
+
+    // println!("{} {}", line, offs );
+    unsafe {
+      dh.as_slice(line, |x, len| {
+        if len == 0 {
+          return;
+        }
+        print!("{} {}: ", line, len);
+        for i in range(0,10) {
+          print!("{} ", x[i] as char);
+        }
+      });
+      println!("");
+    }
+  }
 }
