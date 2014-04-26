@@ -1,6 +1,5 @@
 #![crate_id = "meh"]
 
-
 extern crate std;
 
 use std::io::File;
@@ -8,31 +7,73 @@ use std::path::Path;
 use std::libc;
 use std::io::BufferedReader;
 
-pub struct MappedFile {
-  fd : libc::c_int,
-  map : std::os::MemoryMap,
-  size : uint,
-    
+pub struct Fd {
+  fd : libc::c_int
 }
 
+pub struct MappedFile {
+  map : std::os::MemoryMap,
+  fd : Fd,
+  size : uint,
+}
 
-impl MappedFile {
-  fn new( path : &std::path::Path ) -> MappedFile {
+impl Fd {
+  fn open( path : &std::path::Path, write : bool ) -> Fd {
+    let mode :libc::c_int = if write {
+      libc::O_RDWR | libc::O_CREAT
+    } else {
+      libc::O_RDONLY
+    };
+
     let filename = path.filename_str().unwrap();
-
-    let size = path.stat().unwrap().size;
 
     let fd = unsafe {
       filename.to_c_str().with_ref( |filename| {
-        libc::open( filename, libc::O_RDONLY as libc::c_int, 0)
+        libc::open( filename, mode, 0)
       })
     };
 
     if fd == -1 {
-      fail!("cannot open file {}", filename );
+      fail!("cannot create file {}", filename );
     }
 
-    let map = std::os::MemoryMap::new(size as uint, [std::os::MapReadable, std::os::MapFd(fd)]).unwrap();
+    Fd{ fd: fd }
+  }
+}
+
+impl Drop for Fd {
+  fn drop( &mut self ) {
+    unsafe {
+      if self.fd != -1 {
+        libc::close(self.fd);
+        self.fd = -1;
+        // println!("closing\n");
+      }
+    }
+  }
+}
+
+impl MappedFile {
+  fn create_write( path : &std::path::Path, size : u64 ) -> MappedFile {
+    {
+      let mut f = File::create(path);
+      f.seek((size - 1) as i64, std::io::SeekSet).unwrap();
+      f.write_u8(0).unwrap();
+    }
+    
+    let fd = Fd::open( path, true );
+    let map = std::os::MemoryMap::new(size as uint, [std::os::MapReadable, std::os::MapWritable, std::os::MapFd(fd.fd)]).unwrap();
+
+    MappedFile{ fd : fd, map : map, size : size as uint }
+  }
+
+  fn open_read( path : &std::path::Path ) -> MappedFile {
+   
+    let size = path.stat().unwrap().size;
+ 
+    let fd = Fd::open( path, false );
+
+    let map = std::os::MemoryMap::new(size as uint, [std::os::MapReadable, std::os::MapFd(fd.fd)]).unwrap();
 
     MappedFile{ fd : fd, map : map, size : size as uint }
   }
@@ -45,25 +86,29 @@ impl MappedFile {
     unsafe {
       std::ptr::copy_nonoverlapping_memory( v_ptr, self.map.data.offset(offset as int) as *u64, 1);
       // println!("unpack: {} {} {}", offset, self.map.data.offset(offset as int) as *u64, v );
-
     }
-    
     v
   }
-}
 
-impl Drop for MappedFile {
-  fn drop(&mut self) {
-      unsafe {
-        if self.fd != -1 {
-          libc::close(self.fd);
-          self.fd = -1;
-          println!("closing\n");
-        }
-      }
+  fn pack_u64( &self, offset : u64, v : u64 ) {
+    let v_ptr = &v as *u64;
+
+    unsafe {
+      std::ptr::copy_nonoverlapping_memory( self.map.data.offset(offset as int) as *mut u64, v_ptr, 1);
+      // println!( "pack: {} {}", offset, v );
+    }
+    
+  }
+
+  fn pack_str( &self, offset : u64, s : &str ) {
+    unsafe {
+      s.to_c_str().with_ref( |s_ptr| {
+        std::ptr::copy_nonoverlapping_memory( self.map.data.offset(offset as int) as *mut i8, s_ptr, s.len() + 1);
+         
+      })
+    }
   }
 }
-
 
 
 fn hash( s : &str ) -> u64 {
@@ -121,18 +166,26 @@ impl HashBuilder {
       file.write_str(name).unwrap();
       file.write_u8(0).unwrap();
 
+     
+      // write file size
       let path = Path::new(name);
       let size = path.stat().unwrap().size as u64; 
-      let mut in_file = File::open(&path);
-      let data = in_file.read_to_end().unwrap();
-
-      // write file size
+   
       file.write_le_u64(size).unwrap();
       let out_pos = align(file.tell().unwrap()) as i64;
 
       // write file content
       file.seek(out_pos, std::io::SeekSet).unwrap();
-      file.write(data).unwrap();
+      if size != 0 {
+        let map = MappedFile::open_read(&Path::new(filename));
+        unsafe {
+          std::slice::raw::mut_buf_as_slice(map.map.data as *mut u8, size as uint, |x|{
+            file.write(x).unwrap();
+          });
+        }
+      }
+    
+
     } 
 
     // write hash chains (i.e., the 'next pointers')
@@ -144,6 +197,56 @@ impl HashBuilder {
     }
   }
 
+  pub fn write_mmap( &self, filename : &str ) -> () {
+    // print!( "create\n");
+    let out_size = self.append_pos + 8;
+
+    let map = MappedFile::create_write(&Path::new(filename), out_size);
+    
+    // write table size to the end of the file
+    map.pack_u64( self.append_pos, self.table_size);
+    
+    // copy the files to the output file
+    for p in self.file_dest.iter() {
+      let (ref name, offset) = *p;
+      let name = name.as_slice();
+
+      // write name (0 terminated)
+      map.pack_str(offset, name);
+
+      let path = Path::new(name);
+      let size = path.stat().unwrap().size as u64; 
+      let mut in_file = File::open(&path);
+
+      // write file size
+      map.pack_u64(offset + name.len() as u64 + 1, size);
+      // write file content
+      println!( "write: {}", name);
+      let offset = align((offset + name.len() as u64 + 1 + 8));
+      if size != 0 {
+        unsafe {
+          std::slice::raw::mut_buf_as_slice(map.map.data.offset(offset as int) as *mut u8, size as uint, |x|{
+            in_file.read(x).unwrap();
+          });
+        }
+      }
+    } 
+
+    // write hash chains (i.e., the 'next pointers')
+    for p in self.chain_links.iter() {
+      let (offs, v) = *p;
+      
+      map.pack_u64( offs, v );
+    }
+
+    // println!( "write");
+    // let mut file = File::create(&Path::new("hash.bin"));
+    // unsafe {
+    //   std::slice::raw::mut_buf_as_slice(map.map.data as *mut u8, out_size as uint, |x|{
+    //     file.write(x).unwrap();
+    //   });
+    // }
+  }
 
   pub fn add( &mut self, filename : &str ) -> () {
     // print!( "add file {}\n", filename );
@@ -195,47 +298,6 @@ impl HashBuilder {
   }
 }
 
-
-// struct DiskHash {
-
-// }
-
-// struct FileDescriptor(libc::c_int);
-
-// impl Drop for FileDescriptor {
-//     fn finalize(&self) { unsafe { libc::close(**self); } }
-// }
-
-// unsafe fn open(filename : &str) -> FileDescriptor {
-//     let fd = libc::open(filename.as_ptr(), libc::O_RDONLY as libc::c_int, 0);
-    
-//     if fd < 0 {
-//         fail!(format!("failure in open({}): {}", filename, std::os::last_os_error()));
-//     }
-//     return FileDescriptor(fd);
-// }
-
-// fn print_chain( map : &std::os::MemoryMap, offs : u64 ) {
-//   let mut next_offs = 0;
-//   let mut name : (~str);
-//   unsafe {
-//     std::slice::raw::buf_as_slice(map.data.offset(offs as int) as *u64, 1, |sl| {
-//       next_offs = sl[0];
-//     });
-//     name = std::str::raw::from_c_str( map.data.offset((offs + 8) as int) as *std::libc::c_char );
-
-
-//   }
-//   print!( " -> {} ", name );
-//   if next_offs != 0 {
-//     print_chain( map, next_offs);
-//   } else {
-//     println!("");
-//   }
-
-// }
-
-
 pub struct DiskHash {
   map : std::rc::Rc<MappedFile>, 
   table_size : u64
@@ -258,12 +320,10 @@ impl Access {
   }
 }
 
-
-
 impl DiskHash {
   pub fn new( path : &std::path::Path ) -> DiskHash {
     
-    let map = MappedFile::new(path);
+    let map = MappedFile::open_read(path);
 
     let ts_offs = map.size - 8;
     let table_size = map.unpack_u64(ts_offs as u64);
@@ -312,7 +372,8 @@ fn main() {
     //print!("{} {}\n", line, hash(line));
     builder.add(line);
   }
-  builder.write("hash.bin");
+  // builder.write("hash.bin");
+  builder.write_mmap("hash.bin");
   
   // test_mmap();
   let dh_path = Path::new("hash.bin");
